@@ -1,6 +1,6 @@
 {
   "name": "@stfade/pi-read-delegator",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Pi extension that delegates all read operations to a Reader subagent, blocking read tools from the main model",
   "main": "index.js",
   "types": "index.d.ts",

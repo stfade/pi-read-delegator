@@ -1,380 +1,242 @@
-/**
- * index.ts — pi-read-delegator extension entry point
- *
- * Lifecycle:
- *   init(agent)  → load config, check deps, ensure template, enable/disable
- *   enable(agent) → block tools, add system prompt, attach bash filter
- *   disable(agent) → restore tools, remove prompt, detach bash filter
- *
- * Commands:
- *   /read-delegator on     → enable the delegator
- *   /read-delegator off    → disable the delegator
- *   /read-delegator status  → show current status
- */
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 
-import { loadConfig, type ReadDelegatorConfig, saveConfig } from "./config";
-import { blockTools, restoreTools, getBlockedTools } from "./tool-blocker";
-import { isReadCommand, isWriteCommand, wrapForReader } from "./bash-filter";
-import {
-	checkDependencies,
-	ensureReaderTemplate,
-	callReader,
-	handleReaderError,
-	type AgentWithSubagent,
-} from "./reader-manager";
-import {
-	getLanguage,
-	msg,
-	log,
-	logWarn,
-	logError,
-	initStatusBar,
-	updateStatusBar,
-	getStatus,
-} from "./ui";
-
-// ---------------------------------------------------------------------------
-// Enhanced Agent type (what we expect from Pi's runtime)
-// ---------------------------------------------------------------------------
+import type {
+	ExtensionAPI,
+	ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 
 /**
- * The Pi agent interface as consumed by pi-read-delegator.
- * Extends the building-block types from sub-modules.
+ * pi-read-delegator --- default factory function.
+ *
+ * Blocks read tools from the orchestrator and tells it to delegate every
+ * file-read / search task to the 'reader' subagent.
  */
-export interface PiAgent extends AgentWithSubagent {
-	/** Return current tool definitions. */
-	getTools(): Array<{ name: string }>;
-	/** Remove a tool by name. */
-	removeTool(name: string): void;
-	/** Add/re-add a tool definition. */
-	addTool(definition: { name: string; [key: string]: unknown }): void;
-	/** Append a persistent system message to the conversation. */
-	addSystemMessage(text: string): void;
-	/** Remove a previously-added system message by its exact text. */
-	removeSystemMessage(text: string): void;
-	/** Register a hook that fires BEFORE a tool with the given name is called. */
-	onBeforeToolCall(
-		toolName: string,
-		callback: (params: unknown) => Promise<unknown> | unknown,
-	): void;
-	/** Register a Pi command (like /read-delegator on). */
-	registerCommand(
-		name: string,
-		handler: (args: string[]) => Promise<string> | string,
-	): void;
-	/** Execute a raw shell command directly on the system. */
-	executeShellCommand(
-		command: string,
-	): Promise<{ stdout: string; stderr: string }>;
-	/** Prompt the user for input. */
-	promptUser(message: string): Promise<string>;
-	/** Display a message to the user. */
-	displayMessage(message: string): void;
-	/** Set status bar text. */
-	setStatusBarText(text: string): void;
+
+interface ReadDelegatorConfig {
+	enabled: boolean;
+	reader_subagent_name: string;
+	blocked_tools: string[];
+	orchestrator_prompt: string;
+	language: string;
 }
 
-// ---------------------------------------------------------------------------
-// Module state
-// ---------------------------------------------------------------------------
+const DEFAULT_CONFIG: ReadDelegatorConfig = {
+	enabled: true,
+	reader_subagent_name: "reader",
+	blocked_tools: ["read", "grep", "find", "ls"],
+	orchestrator_prompt: [
+		"You are an orchestrator. You do NOT have direct file-reading tools.",
+		"For any file reading, searching, or directory listing, use the",
+		"'subagent' tool with agent='reader'.",
+		'Example: subagent(agent: "reader", task: "Find all TS files that import \'lodash\'")',
+		"Never try to use read, grep, find, or ls yourself. Always delegate.",
+	].join("\n"),
+	language: "auto",
+};
 
-let enabled = false;
-let config: ReadDelegatorConfig | null = null;
-let currentSystemMessage: string | null = null;
+const READ_BASH_COMMANDS = new Set([
+	"cat",
+	"grep",
+	"find",
+	"ls",
+	"head",
+	"tail",
+	"less",
+	"wc",
+	"nl",
+	"more",
+	"bat",
+	"rg",
+	"fd",
+	"awk",
+	"du",
+	"df",
+	"stat",
+	"file",
+	"which",
+	"where",
+	"type",
+	"dir",
+]);
 
-// ---------------------------------------------------------------------------
-// Lifecycle: init
-// ---------------------------------------------------------------------------
-
-/**
- * Initialize the extension.
- *
- * This is the function Pi calls when loading the extension.
- * It returns a lifecycle object with enable() and disable().
- */
-export function init(agent: PiAgent): {
-	enable: () => void;
-	disable: () => void;
-} {
-	// 1. Load configuration
-	config = loadConfig();
-
-	// 2. Detect language
-	getLanguage(config.language);
-
-	// 3. Initialize status bar
-	initStatusBar(agent);
-
-	// 4. Register commands
-	registerCommands(agent);
-
-	// 5. Run async init tasks (dependency check, template) in background.
-	//    We do NOT block init — if deps are missing the user will be prompted.
-	initAsync(agent);
-
-	// Build lifecycle interface
-	const enable = () => doEnable(agent);
-	const disable = () => doDisable(agent);
-
-	// If config says enabled, auto-enable (synchronous part first)
-	if (config?.enabled) {
-		doEnable(agent);
-	}
-
-	return { enable, disable };
+function configPath(): string {
+	return path.join(os.homedir(), ".pi", "agent", "read-delegator.json");
 }
 
-// ---------------------------------------------------------------------------
-// Async initialization (runs in background)
-// ---------------------------------------------------------------------------
+function readerPath(): string {
+	return path.join(os.homedir(), ".pi", "agent", "agents", "reader.md");
+}
 
-async function initAsync(agent: PiAgent): Promise<void> {
+function loadConfig(): ReadDelegatorConfig {
+	const cp = configPath();
 	try {
-		// Check pi-subagents dependency
-		await checkDependencies(agent.promptUser);
-	} catch (err) {
-		logError("deps_failed");
-		logError("reader_failed", String(err));
-		// Disable the extension if dependencies can't be satisfied
-		doDisable(agent);
-		return;
-	}
-
-	// Ensure reader.md template exists
-	const templateOk = ensureReaderTemplate();
-	if (!templateOk) {
-		logWarn(
-			"reader_failed",
-			"Reader template could not be created. Create ~/.pi/agent/agents/reader.md manually.",
-		);
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Enable / Disable
-// ---------------------------------------------------------------------------
-
-function doEnable(agent: PiAgent): void {
-	if (enabled) {
-		agent.displayMessage(msg("already_blocked"));
-		return;
-	}
-
-	if (!config) {
-		logError("reader_failed", "No configuration loaded.");
-		return;
-	}
-
-	// Block read tools
-	blockTools(agent, config.blocked_tools);
-
-	// Add system message
-	currentSystemMessage = config.orchestrator_prompt;
-	agent.addSystemMessage(config.orchestrator_prompt);
-
-	// Attach bash filter hook
-	attachBashFilter(agent);
-
-	// Update status
-	enabled = true;
-	updateStatusBar("active");
-	log("enabled");
-
-	agent.displayMessage(msg("enabled"));
-}
-
-function doDisable(agent: PiAgent): void {
-	if (!enabled) {
-		agent.displayMessage(msg("already_enabled"));
-		return;
-	}
-
-	// Restore read tools
-	restoreTools(agent);
-
-	// Remove system message
-	if (currentSystemMessage) {
-		try {
-			agent.removeSystemMessage(currentSystemMessage);
-		} catch {
-			// Best effort — the message text may have been mutated
+		if (fs.existsSync(cp)) {
+			const raw = fs.readFileSync(cp, "utf8");
+			const parsed = JSON.parse(raw);
+			return { ...DEFAULT_CONFIG, ...parsed };
 		}
-		currentSystemMessage = null;
+	} catch {
+		// corrupt file --- fall back to defaults
 	}
-
-	// Detach bash filter (we can't undo onBeforeToolCall, but we set a flag)
-	enabled = false;
-	updateStatusBar("idle");
-	log("disabled");
-
-	agent.displayMessage(msg("disabled"));
+	try {
+		const dir = path.dirname(cp);
+		fs.mkdirSync(dir, { recursive: true });
+		fs.writeFileSync(cp, JSON.stringify(DEFAULT_CONFIG, null, 2), "utf8");
+	} catch {
+		// read-only home directory --- ignore
+	}
+	return { ...DEFAULT_CONFIG };
 }
 
-// ---------------------------------------------------------------------------
-// Bash filter hook
-// ---------------------------------------------------------------------------
+function saveConfig(config: ReadDelegatorConfig): void {
+	const cp = configPath();
+	try {
+		const dir = path.dirname(cp);
+		fs.mkdirSync(dir, { recursive: true });
+		fs.writeFileSync(cp, JSON.stringify(config, null, 2), "utf8");
+	} catch {
+		// read-only home directory --- ignore
+	}
+}
+
+async function ensureReaderTemplate(): Promise<void> {
+	const rp = readerPath();
+	if (fs.existsSync(rp)) return;
+
+	const content = [
+		"---",
+		"name: reader",
+		"description: Token-efficient code reader that returns minimal results.",
+		"tools: read, grep, find, ls",
+		"model: lmstudio/nvidia/nemotron-3-nano-4b",
+		"---",
+		"",
+		"You are a token-efficient analyst. Execute read/search/list tasks and return",
+		"ONLY the essential result. Maximum 10 lines. Use bullet summaries.",
+		"Never dump entire files. Focus only on what was asked.",
+	].join("\n");
+
+	try {
+		const dir = path.dirname(rp);
+		fs.mkdirSync(dir, { recursive: true });
+		await fs.promises.writeFile(rp, content, "utf8");
+	} catch {
+		// read-only home directory --- template creation is best-effort
+	}
+}
 
 /**
- * Attach a before-tool-call hook on the "bash" (and "shell") tools.
+ * Determine which tools should stay active after blocking read tools.
  *
- * When the main model tries to execute a bash command:
- *  - Read commands → forwarded to Reader subagent
- *  - Write commands → executed directly
- *  - Ambiguous → user is prompted
+ * We MUST keep the 'subagent' tool (registered by pi-subagents) active;
+ * otherwise the orchestrator cannot call the reader at all.
  */
-function attachBashFilter(agent: PiAgent): void {
-	// Hook both "bash" and "shell" tools, since Pi may expose either.
-	const bashToolNames = ["bash", "shell"];
+function computeActiveTools(pi: ExtensionAPI, blocked: string[]): string[] {
+	const all = pi.getAllTools();
+	const blockedSet = new Set(blocked);
 
-	for (const toolName of bashToolNames) {
-		try {
-			agent.onBeforeToolCall(toolName, async (params: unknown) => {
-				// Only intercept if the extension is enabled
-				if (!enabled || !config) return undefined; // undefined = proceed normally
+	// Always keep "subagent" --- it is the bridge to the reader.
+	const forceKeep = new Set(["subagent"]);
 
-				const p = params as Record<string, unknown>;
-				const command = typeof p.command === "string" ? p.command : "";
-
-				if (!command) return undefined; // Let the tool handle the error
-
-				// Classify the command
-				if (isWriteCommand(command)) {
-					// Let the raw bash/shell tool execute this directly
-					return undefined; // undefined → Pi runs the original tool
-				}
-
-				if (isReadCommand(command)) {
-					// Forward to Reader subagent
-					log("reader_calling", command);
-
-					try {
-						const result = await callReader(
-							agent,
-							config,
-							wrapForReader(command),
-						);
-						log("reader_done");
-						// Return the result directly — Pi will use this as the tool output
-						// instead of running the original bash command.
-						return { result, subagent_used: true };
-					} catch (err) {
-						logError("reader_failed", String(err));
-
-						// Offer the [R/A/C] dialog
-						try {
-							const handled = await handleReaderError(
-								agent,
-								config,
-								config.blocked_tools,
-								err,
-								wrapForReader(command),
-								agent.promptUser,
-							);
-							// If "Allow once" was selected, return a special marker
-							if (handled.startsWith("[ALLOW_ONCE]")) {
-								return { result: handled, allow_once: true };
-							}
-							// Retry succeeded — return the result
-							return { result: handled, subagent_used: true };
-						} catch (finalErr) {
-							updateStatusBar("error");
-							return {
-								error: true,
-								message:
-									finalErr instanceof Error
-										? finalErr.message
-										: "Reader failed",
-							};
-						}
-					}
-				}
-
-				// Ambiguous command → ask user
-				const answer = await agent.promptUser(
-					`The command "${command}" may read files. Run via Reader? [Y/n]`,
-				);
-
-				if (
-					answer.trim().toLowerCase() === "n" ||
-					answer.trim().toLowerCase() === "no"
-				) {
-					// Let the original tool run
-					return undefined;
-				}
-
-				// Forward to Reader
-				log("reader_calling", command);
-				try {
-					const result = await callReader(
-						agent,
-						config,
-						wrapForReader(command),
-					);
-					log("reader_done");
-					return { result, subagent_used: true };
-				} catch (err) {
-					logError("reader_failed", String(err));
-					return {
-						error: true,
-						message: err instanceof Error ? err.message : "Reader failed",
-					};
-				}
-			});
-		} catch {
-			// onBeforeToolCall not supported for this tool — no-op
-		}
-	}
+	return all
+		.map((t: ToolDefinition) => t.name)
+		.filter((name: string) => forceKeep.has(name) || !blockedSet.has(name));
 }
 
 // ---------------------------------------------------------------------------
-// Pi commands
+// Extension entry
 // ---------------------------------------------------------------------------
 
-function registerCommands(agent: PiAgent): void {
-	agent.registerCommand("read-delegator", async (args: string[]) => {
-		const sub = args[0]?.toLowerCase();
+export default async function (pi: ExtensionAPI) {
+	const config = loadConfig();
+	if (!config.enabled) return;
 
-		switch (sub) {
-			case "on":
-			case "enable": {
-				if (!config) {
-					config = loadConfig();
-				}
-				config.enabled = true;
-				saveConfig(config, { silent: true });
-				doEnable(agent);
-				return msg("enabled");
+	// --- 1. Block read tools ------------------------------------------------
+	const active = computeActiveTools(pi, config.blocked_tools);
+	pi.setActiveTools(active);
+
+	// --- 2. Inject orchestrator system prompt -------------------------------
+	pi.on("before_agent_start", async (event, _ctx) => {
+		return {
+			systemPrompt: `${event.systemPrompt}\n\n${config.orchestrator_prompt}`,
+		};
+	});
+
+	// --- 3. Intercept bash read commands ------------------------------------
+	//
+	// When the LLM tries `cat some-file` or similar, we block the call and
+	// tell it to route through the reader subagent instead.
+	pi.on("tool_call", async (event, _ctx) => {
+		if (event.toolName === "bash" || event.toolName === "shell") {
+			const command = String(
+				(event.input as { command?: string } | undefined)?.command ?? "",
+			);
+			const firstWord = command.trim().split(/\s+/)[0]?.toLowerCase() ?? "";
+
+			if (READ_BASH_COMMANDS.has(firstWord)) {
+				return {
+					block: true,
+					reason: [
+						`Use subagent(agent: "reader", task: "Execute and summarize: ${command}")`,
+						"instead of running file-reading commands directly.",
+					].join(" "),
+				};
 			}
-
-			case "off":
-			case "disable": {
-				if (config) {
-					config.enabled = false;
-					saveConfig(config, { silent: true });
-				}
-				doDisable(agent);
-				return msg("disabled");
-			}
-
-			case "status": {
-				const status = getStatus();
-				const blocked = getBlockedTools();
-				return (
-					`pi-read-delegator is ${status}\n` +
-					`Enabled: ${enabled ? "yes" : "no"}\n` +
-					`Blocked tools: ${blocked.join(", ") || "(none)"}\n` +
-					`Reader subagent: ${config?.reader_subagent_name ?? "reader"}\n` +
-					`Language: ${config?.language ?? "auto"}`
-				);
-			}
-
-			default:
-				return (
-					"Usage:\n" +
-					"  /read-delegator on     — enable read delegation\n" +
-					"  /read-delegator off    — disable read delegation\n" +
-					"  /read-delegator status — show current status"
-				);
 		}
+	});
+
+	// --- 4. Register /read-delegator command --------------------------------
+	pi.registerCommand("read-delegator", {
+		description: "Manage read delegation (on|off|status)",
+		handler: async (args: string | undefined, ctx: any) => {
+			const sub = args?.trim().toLowerCase() ?? "status";
+
+			switch (sub) {
+				case "on":
+				case "enable": {
+					config.enabled = true;
+					saveConfig(config);
+					const active2 = computeActiveTools(pi, config.blocked_tools);
+					pi.setActiveTools(active2);
+					ctx.ui.notify("🟢 Read delegation enabled", "info");
+					return;
+				}
+
+				case "off":
+				case "disable": {
+					config.enabled = false;
+					saveConfig(config);
+					// Restore all tools
+					pi.setActiveTools(pi.getAllTools().map((t) => t.name));
+					(ctx as any).ui.notify("🔴 Read delegation disabled", "info");
+					(ctx as any).ui.setStatus("read-delegator", undefined);
+					return;
+				}
+
+				case "status":
+				default: {
+					const lines = [
+						`Read delegation: ${config.enabled ? "🟢 enabled" : "🔴 disabled"}`,
+						`Blocked tools: ${config.blocked_tools.join(", ")}`,
+						`Reader subagent: ${config.reader_subagent_name}`,
+					];
+					(ctx as any).ui.notify(lines.join("\n"), "info");
+					return;
+				}
+			}
+		},
+	});
+
+	// --- 5. Ensure reader.md template ---------------------------------------
+	await ensureReaderTemplate();
+
+	// --- 6. Status bar ------------------------------------------------------
+	pi.on("session_start", async (_event, ctx) => {
+		ctx.ui.setStatus(
+			"read-delegator",
+			`● reader: ${config.reader_subagent_name}`,
+		);
 	});
 }
