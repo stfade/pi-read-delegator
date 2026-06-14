@@ -1,0 +1,49 @@
+{
+  "name": "@stfade/pi-read-delegator",
+  "version": "1.0.4",
+  "description": "Pi extension that delegates all read operations to a Reader subagent, blocking read tools from the main model",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "pi-extension": true,
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "config.js",
+    "config.d.ts",
+    "tool-blocker.js",
+    "tool-blocker.d.ts",
+    "bash-filter.js",
+    "bash-filter.d.ts",
+    "reader-manager.js",
+    "reader-manager.d.ts",
+    "ui.js",
+    "ui.d.ts",
+    "templates/reader.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "read-delegator",
+    "subagent",
+    "reader"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0"
+  },
+  "peerDependencies": {
+    "pi-subagents": "*"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "pi": {
+    "extensions": ["./index.js"]
+  }
+}
