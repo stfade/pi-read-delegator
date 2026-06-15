@@ -43,9 +43,9 @@ const messages: Record<string, Record<string, string>> = {
 		tr: "❌ Reader: başarısız - ",
 		en: "❌ Reader: failed - ",
 	},
-	deps_missing: {
-		tr: "⚠️ pi-subagents yüklü değil. Yüklensin mi? [E/h]",
-		en: "⚠️ pi-subagents not installed. Install now? [Y/n]",
+	deps_required: {
+		tr: "📦 pi-subagents zorunlu bağımlılık — yükleniyor…",
+		en: "📦 pi-subagents required dependency — installing…",
 	},
 	deps_installing: {
 		tr: "📦 pi-subagents yükleniyor…",
@@ -62,10 +62,6 @@ const messages: Record<string, Record<string, string>> = {
 	status_active: {
 		tr: "🟢 reader",
 		en: "🟢 reader",
-	},
-	status_idle: {
-		tr: "○ reader",
-		en: "○ reader",
 	},
 	status_error: {
 		tr: "⚠ reader",
@@ -209,7 +205,7 @@ export function updateStatusBar(status: Status): void {
 			text = msg("status_off");
 			break;
 		default:
-			text = msg("status_idle");
+			text = msg("status_off");
 			break;
 	}
 

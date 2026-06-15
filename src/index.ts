@@ -5,7 +5,7 @@
  * file-read / search task to the 'reader' subagent.
  *
  * Architecture:
- *  - Factory body: registration only (pi.on, pi.registerCommand, ensureReaderTemplate)
+ *  - Factory body: registration only (pi.on, pi.registerCommand, syncReaderTemplate)
  *  - session_start: dependency check → tool blocking → status bar
  *  - before_agent_start: inject orchestrator system prompt
  *  - tool_call: intercept bash read commands → redirect to reader
@@ -47,8 +47,16 @@ function syncReaderTemplate(model: string): void {
 			"name: reader",
 			"description: Compact code-reader — executes tasks, returns results with line numbers",
 			"tools: read, grep, find, ls",
+			"extensions:",
 			`model: ${model}`,
 			"---",
+			"",
+			"You are a READ-ONLY agent with STRICT limits.",
+			"You CANNOT write, edit, delete, or modify any file.",
+			"You CANNOT execute shell commands or run programs.",
+			"You CANNOT spawn subagents or delegate work to other agents.",
+			"Your ONLY capabilities: read, grep, find, ls.",
+			"Do not ask for additional capabilities — you have none.",
 			"",
 			"Execute the task. Return only the result, nothing else.",
 			"Always include line numbers for grep and read results.",
@@ -184,7 +192,6 @@ function createProgressCallback(ctx: {
 async function performDependencyCheck(
 	ctx: {
 		ui: {
-			confirm(title: string, message: string): Promise<boolean>;
 			setStatus(id: string, text: string): void;
 			notify(
 				text: string,
@@ -194,12 +201,9 @@ async function performDependencyCheck(
 	},
 	config: ReadDelegatorConfig,
 ): Promise<boolean> {
-	const promptFn = async (message: string): Promise<string> => {
-		const ok = await ctx.ui.confirm("pi-subagents required", message);
-		return ok ? "y" : "n";
-	};
+	ctx.ui.notify(msg("deps_required"), "info");
 
-	const ready = await checkDependencies(promptFn, createProgressCallback(ctx));
+	const ready = await checkDependencies(createProgressCallback(ctx));
 
 	if (!ready) {
 		config.enabled = false;
@@ -227,8 +231,7 @@ export default async function (pi: ExtensionAPI) {
 	// Detect language
 	getLanguage(config.language);
 
-	// Quick sync dependency check — interactive prompt is deferred to
-	// session_start where we have access to ctx.ui.confirm().
+	// Quick sync dependency check — auto-install is deferred to session_start.
 	let depsReady = isSubagentsInstalled();
 	let depsChecked = depsReady; // if already ready, no need to check again
 
@@ -314,13 +317,6 @@ export default async function (pi: ExtensionAPI) {
 
 	// Shortcut: enable/disable toggle with subcommand syntax (kept for back compat)
 	pi.registerCommand("read-delegator", {
-		description: "Show read-delegator status",
-		handler: async (_args, ctx) => {
-			showStatus(ctx);
-		},
-	});
-
-	pi.registerCommand("read-delegator-status", {
 		description: "Show read-delegator status",
 		handler: async (_args, ctx) => {
 			showStatus(ctx);

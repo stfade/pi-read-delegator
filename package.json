@@ -1,6 +1,6 @@
 {
   "name": "@stfade/pi-read-delegator",
-  "version": "1.0.13",
+  "version": "1.0.14",
   "description": "Pi extension that delegates all read operations to a Reader subagent, blocking read tools from the main model",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -21,7 +21,7 @@
     "dist/templates/reader.md"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node -e \"require('fs').cpSync('src/templates','dist/templates',{recursive:true})\"",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
