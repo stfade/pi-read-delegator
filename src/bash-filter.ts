@@ -166,14 +166,6 @@ const WRITE_COMMANDS = new Set([
 // ---------------------------------------------------------------------------
 
 /**
- * Shell operators that separate distinct commands in a pipeline or chain.
- * We check each segment independently — if ANY segment starts with a read
- * command, the whole command is treated as containing a read.
- */
-const SHELL_SEPARATORS =
-	/(?:&&|\|\||[;|&])(?=(?:[^"']*["'][^"']*["'])*[^"']*$)/;
-
-/**
  * Output redirect operators. These turn a read command into a write —
  * e.g. `grep pattern file > out.txt` writes output to a file. We still
  * block these because the actual operation (grep/find/cat) is a read.
@@ -319,31 +311,6 @@ export function isWriteCommand(command: string): boolean {
 	if (REDIRECT_WRITE.test(command)) return true;
 
 	return false;
-}
-
-/**
- * Wrap a shell command into a Reader subagent task.
- *
- * Returns a formatted string instructing the Reader to execute and report
- * minimal results.
- */
-export function wrapForReader(command: string): string {
-	return [
-		"Execute this shell command and return ONLY the essential result.",
-		"Max 5 lines or a single number. Never dump full file contents.",
-		`Command: ${command}`,
-	].join("\n");
-}
-
-/**
- * Wrap a generic task (non-bash) into a Reader subagent task.
- */
-export function wrapTaskForReader(task: string): string {
-	return [
-		"Execute this task and return ONLY the essential result.",
-		"Max 5 lines or a single number. Never dump full file contents.",
-		`Task: ${task}`,
-	].join("\n");
 }
 
 // ---------------------------------------------------------------------------

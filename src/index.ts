@@ -8,7 +8,8 @@
  *  - Factory body: registration only (pi.on, pi.registerCommand, syncReaderTemplate)
  *  - session_start: dependency check → tool blocking → status bar
  *  - before_agent_start: inject orchestrator system prompt
- *  - tool_call: intercept bash read commands → redirect to reader
+ *  - tool_call: intercept bash read commands + subagent enrichment + cache check
+ *  - tool_result: post-process reader output (deterministic optimizations) + cache
  */
 
 import * as fs from "node:fs";
@@ -27,6 +28,11 @@ import {
 import type { InstallProgress } from "./reader-manager";
 import { getLanguage, msg } from "./ui";
 import { isReadCommand } from "./bash-filter";
+import {
+	restoreTools,
+	isAllowOnceActive,
+	consumeAllowOnce,
+} from "./tool-blocker";
 
 // ---------------------------------------------------------------------------
 // Reader template path
@@ -222,6 +228,83 @@ async function performDependencyCheck(
 }
 
 // ---------------------------------------------------------------------------
+// Reader task pre/post processing helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Simple non-cryptographic hash (matches reader-manager.ts simpleHash).
+ */
+function simpleHash(str: string): string {
+	let h = 0;
+	for (let i = 0; i < str.length; i++) {
+		h = (Math.imul(31, h) + str.charCodeAt(i)) | 0;
+	}
+	return h.toString(36);
+}
+
+/**
+ * Extract the Target field from a structured task string.
+ * Format: "Action: read | Target: src/file.ts | Detail: ..."
+ * Also matches looser formats like "Target: src/file.ts".
+ */
+function extractTargetFromTask(task: string): string | null {
+	const match = task.match(/Target:\s*(\S+)/i);
+	return match ? match[1] : null;
+}
+
+/**
+ * Append deterministic optimization rules to a reader task.
+ * These are injected into the task string so the reader model sees them
+ * alongside the user's request — no reliance on system prompt compliance.
+ */
+function enrichTask(task: string): string {
+	if (task.includes("Auto-rules:")) return task; // already enriched
+	return (
+		task +
+		"\n\nAuto-rules: Skip imports. Skip node_modules, .git, dist, binaries. " +
+		"Return count first (e.g. '(5 matches)'). Deduplicate. " +
+		"No markdown headers. Truncate paths to project-relative."
+	);
+}
+
+/**
+ * Post-process reader output with deterministic regex-based optimizations.
+ *
+ * These run on EVERY reader subagent result, guaranteeing token savings
+ * regardless of whether the reader model follows its prompt instructions.
+ */
+function optimizeOutput(text: string, cwd: string): string {
+	let result = text;
+
+	// 1. Strip import/export lines (single-line only)
+	result = result.replace(/^\s*(?:import\b|export\b).*$/gm, "");
+
+	// 2. Truncate absolute project paths to relative
+	if (cwd) {
+		const normalizedCwd = cwd.replace(/\\/g, "/");
+		const escaped = normalizedCwd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+		result = result.replace(new RegExp(escaped + "/?", "g"), "");
+	}
+
+	// 3. Collapse consecutive blank lines from import stripping
+	result = result.replace(/\n{3,}/g, "\n\n");
+
+	// 4. Collapse long type annotations (>40 chars) inside angle brackets
+	result = result.replace(
+		/\b(?:Record|Map|Promise|Array|Set|Partial|Required|Readonly|Pick|Omit|Exclude|Extract)<[^<>]*(?:<[^<>]*>)*[^<>]*>/g,
+		(match) => {
+			if (match.length > 40) {
+				const base = match.match(/^(\w+)/)?.[1] ?? match;
+				return `${base}<...>`;
+			}
+			return match;
+		},
+	);
+
+	return result.trim();
+}
+
+// ---------------------------------------------------------------------------
 // Extension factory — registration only; actions go inside events
 // ---------------------------------------------------------------------------
 
@@ -270,11 +353,18 @@ export default async function (pi: ExtensionAPI) {
 	});
 
 	// -----------------------------------------------------------------------
-	// 3. tool_call: intercept bash read commands
+	// 3. tool_call: intercept bash read commands + subagent enrichment + cache
 	// -----------------------------------------------------------------------
-	pi.on("tool_call", (event, _ctx) => {
+	pi.on("tool_call", (event, ctx) => {
 		if (!config.enabled) return;
 
+		// --- 3a. Allow-once: let blocked read tools through during retry window ---
+		const readTools = new Set(["read", "grep", "find", "ls"]);
+		if (readTools.has(event.toolName) && isAllowOnceActive()) {
+			return; // let it through; re-block happens in tool_result
+		}
+
+		// --- 3b. Bash/shell: block read commands ---
 		if (event.toolName === "bash" || event.toolName === "shell") {
 			const command = String(
 				(event.input as { command?: string } | undefined)?.command ?? "",
@@ -284,21 +374,155 @@ export default async function (pi: ExtensionAPI) {
 			if (isReadCommand(command)) {
 				return {
 					block: true,
-					reason: [
-						'Use subagent(agent: "' +
-							config.reader_subagent_name +
-							'", task: "Execute and summarize: ' +
-							command +
-							'")',
-						"instead of running file-reading commands directly.",
-					].join(" "),
+					reason:
+						'Read commands are blocked. Use subagent(agent:"' +
+						config.reader_subagent_name +
+						'", task:"<format from system prompt>") ' +
+						"instead. Format: Action: read|grep|find|ls | Target: file|dir | Detail: what to find.",
 				};
 			}
+		}
+
+		// --- 3b. Subagent: enrich reader tasks + cache check ---
+		if (event.toolName === "subagent") {
+			const input = event.input as { agent?: string; task?: string };
+			if (input.agent !== config.reader_subagent_name) return;
+
+			const task = input.task ?? "";
+			if (!task) return;
+
+			// Cache check: if this file was already read and hasn't changed,
+			// tell the orchestrator to reuse from context.
+			const target = extractTargetFromTask(task);
+			if (target && ctx.cwd) {
+				const absPath = path.resolve(ctx.cwd, target);
+				if (sessionCache.has(absPath)) {
+					try {
+						const diskContent = fs.readFileSync(absPath, "utf-8");
+						const diskHash = simpleHash(diskContent);
+						if (diskHash === sessionCache.getHash(absPath)) {
+							const cachedLines =
+								sessionCache.get(absPath)?.split("\n").length ?? 0;
+							return {
+								block: true,
+								reason:
+									'File "' +
+									target +
+									'" already in context (' +
+									cachedLines +
+									" lines, unchanged). Reuse from your context window.",
+							};
+						}
+						// File changed — invalidate stale cache entry
+						sessionCache.set(absPath, diskContent);
+					} catch {
+						// File not accessible — let the subagent handle it
+					}
+				}
+			}
+
+			// Enrich task with deterministic optimization rules
+			event.input.task = enrichTask(task);
 		}
 	});
 
 	// -----------------------------------------------------------------------
-	// 4. Commands
+	// 4. tool_result: post-process reader output (optimizations + error handling)
+	// -----------------------------------------------------------------------
+	pi.on("tool_result", (event, ctx) => {
+		if (!config.enabled) return;
+
+		// --- 4a. Allow-once re-block: re-block tools after first read tool use ---
+		const readTools = new Set(["read", "grep", "find", "ls"]);
+		if (readTools.has(event.toolName) && isAllowOnceActive()) {
+			consumeAllowOnce(pi, config.blocked_tools);
+			ctx.ui.notify(
+				"🔒 Read tools re-blocked after allow-once operation.",
+				"info",
+			);
+			return;
+		}
+
+		// --- 4b. Only post-process subagent/reader results ---
+		if (event.toolName !== "subagent") return;
+
+		const input = event.input as { agent?: string; task?: string };
+		if (input.agent !== config.reader_subagent_name) return;
+
+		const task = input.task ?? "";
+
+		// Post-process content with regex-based optimizations
+		if (event.content && Array.isArray(event.content)) {
+			for (const part of event.content) {
+				if (part.type === "text" && typeof part.text === "string") {
+					part.text = optimizeOutput(part.text, ctx.cwd);
+				}
+			}
+		}
+
+		// --- Error detection on reader output ---
+		const fullText =
+			(event.content as Array<{ type: string; text?: string }>)
+				?.filter((p) => p.type === "text")
+				.map((p) => p.text ?? "")
+				.join("\n") ?? "";
+
+		const errorPatterns = [
+			/^Error[:\s]/im,
+			/\[ERROR\]/i,
+			/\[FAILED\]/i,
+			/timeout/i,
+			/no model/i,
+			/unavailable/i,
+		];
+		const isError =
+			fullText.trim().length === 0 ||
+			errorPatterns.some((p) => p.test(fullText));
+
+		if (isError) {
+			// Unblock tools so orchestrator can use direct reads for recovery
+			restoreTools(pi);
+
+			const recoveryMsg =
+				"\n\n[READER FAILED] Reader subagent could not complete this task.\n" +
+				'[R]etry — call subagent(agent="' +
+				config.reader_subagent_name +
+				'", task="...") again.\n' +
+				"[A]llow once — read tools UNBLOCKED for one operation (auto re-block after).\n" +
+				"[C]ancel — skip this read.\n" +
+				"[/read-delegator-off] permanently unblock.  [/read-delegator-on] re-enable.";
+
+			if (event.content && Array.isArray(event.content)) {
+				const textPart = event.content.find((p) => p.type === "text") as
+					| { text?: string }
+					| undefined;
+				if (textPart) textPart.text = (textPart.text ?? "") + recoveryMsg;
+			}
+
+			ctx.ui.notify(
+				"⚠ Reader failed. Read tools temporarily unblocked.",
+				"warning",
+			);
+		}
+
+		// Cache: record the file that was read for future cache checks
+		const target = extractTargetFromTask(task);
+		if (target && ctx.cwd) {
+			const absPath = path.resolve(ctx.cwd, target);
+			try {
+				const content = fs.readFileSync(absPath, "utf-8");
+				sessionCache.set(absPath, content);
+			} catch {
+				// File not accessible — nothing to cache
+			}
+		}
+
+		// Return patched content (event.content mutated in-place above)
+		return { content: event.content };
+	});
+
+	// -----------------------------------------------------------------------
+	// 5. Commands
 	// -----------------------------------------------------------------------
 
 	// Shared status helper
@@ -372,6 +596,6 @@ export default async function (pi: ExtensionAPI) {
 		},
 	});
 
-	// 5. Background: sync reader.md template from config
+	// 6. Background: sync reader.md template from config
 	syncReaderTemplate(config.reader_model);
 }

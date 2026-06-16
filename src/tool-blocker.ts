@@ -1,162 +1,128 @@
 /**
  * tool-blocker.ts — Tool removal and restoration for pi-read-delegator
  *
- * Pi's Extension API exposes:
- *   agent.getTools()          → ToolDefinition[]
- *   agent.removeTool(name)    → void
- *   agent.addTool(definition)  → void
- *
- * We store removed tool definitions in a Map so they can be restored later.
+ * Uses Pi's ExtensionAPI (setActiveTools / getAllTools) to block and
+ * restore read tools on the orchestrator model.
  */
 
-import { rawLog, rawError } from "./ui";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 // ---------------------------------------------------------------------------
-// Types (what we assume Pi's API gives us)
+// State
 // ---------------------------------------------------------------------------
 
-/** Minimal shape for a Pi tool definition. */
-export interface ToolDefinition {
-	name: string;
-	description?: string;
-	[key: string]: unknown;
-}
-
-/** The Pi agent interface this module operates on. */
-export interface ExtensionAgent {
-	getTools(): ToolDefinition[];
-	removeTool(name: string): void;
-	addTool(definition: ToolDefinition): void;
-}
-
-// ---------------------------------------------------------------------------
-// Tool blocker state
-// ---------------------------------------------------------------------------
-
-/** Stores tool definitions that were removed, keyed by tool name. */
-const removedTools = new Map<string, ToolDefinition>();
+let blockedSet = new Set<string>();
+let allowOnceFlag = false;
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
 /**
- * Remove the listed tools from the agent.
- * Saves their definitions so they can be restored later.
- * If a tool is already removed, it is silently skipped.
+ * Remove the listed tools from the orchestrator's active set.
+ * Calls pi.setActiveTools() with the filtered list.
  */
-export function blockTools(agent: ExtensionAgent, tools: string[]): void {
-	const currentTools = agent.getTools();
-
-	for (const toolName of tools) {
-		// Skip if already removed
-		if (removedTools.has(toolName)) continue;
-
-		const definition = currentTools.find((t) => t.name === toolName);
-		if (definition) {
-			removedTools.set(toolName, definition);
-			try {
-				agent.removeTool(toolName);
-				rawLog(`Blocked tool: ${toolName}`);
-			} catch (err) {
-				rawError(`Failed to block tool "${toolName}": ${err}`);
-			}
-		}
-	}
+export function blockTools(pi: ExtensionAPI, tools: string[]): void {
+	blockedSet = new Set(tools);
+	applyBlock(pi);
 }
 
 /**
- * Restore all previously blocked tools to the agent.
- * If a tool was never removed, it is skipped.
+ * Restore all previously blocked tools (set all tools as active).
  */
-export function restoreTools(agent: ExtensionAgent): void {
-	for (const [toolName, definition] of removedTools.entries()) {
-		try {
-			agent.addTool(definition);
-			rawLog(`Restored tool: ${toolName}`);
-		} catch (err) {
-			rawError(`Failed to restore tool "${toolName}": ${err}`);
-		}
-	}
-	removedTools.clear();
+export function restoreTools(pi: ExtensionAPI): void {
+	const all = pi.getAllTools().map((t) => t.name);
+	pi.setActiveTools(all);
+	blockedSet.clear();
+	allowOnceFlag = false;
 }
 
 /**
- * Temporarily allow the main model to use blocked tools for one operation.
+ * Temporarily allow blocked tools for one operation.
  *
- * 1. Restore the tools
- * 2. Await the callback (which performs the read)
- * 3. Re-block the tools
+ * 1. Restore all tools
+ * 2. Run callback (orchestrator makes its read call)
+ * 3. Re-block tools after callback resolves
  *
- * @param agent        The Pi agent
- * @param blockedTools List of tool names that should stay blocked normally
- * @param callback     Async function to run while tools are available
- * @returns The callback's return value
+ * The re-block sets allowOnceFlag = true so the next tool_result
+ * triggers automatic re-blocking.
  */
 export async function tempAllowOnce<T>(
-	agent: ExtensionAgent,
+	pi: ExtensionAPI,
 	blockedTools: string[],
 	callback: () => Promise<T>,
 ): Promise<T> {
-	// Restore temporarily
-	const restoredNow: string[] = [];
-
-	// We need to get the definitions from our map, but they might not be there
-	// if the tools were never initially blocked. In that case, we just re-block
-	// the names after.
-	for (const toolName of blockedTools) {
-		const definition = removedTools.get(toolName);
-		if (definition) {
-			try {
-				agent.addTool(definition);
-				// Remove from the map temporarily so restoreTools doesn't double-restore
-				removedTools.delete(toolName);
-				restoredNow.push(toolName);
-			} catch (err) {
-				rawError(`Failed to temporarily restore "${toolName}": ${err}`);
-			}
-		}
-	}
+	const all = pi.getAllTools().map((t) => t.name);
+	pi.setActiveTools(all);
+	allowOnceFlag = true;
 
 	try {
-		// Run the callback while tools are available
 		const result = await callback();
 		return result;
 	} finally {
-		// Re-block the tools we restored
-		for (const toolName of restoredNow) {
-			// Find the definition from agent's current tool list before removing
-			const currentTools = agent.getTools();
-			const definition = currentTools.find((t) => t.name === toolName);
-			if (definition) {
-				removedTools.set(toolName, definition);
-				try {
-					agent.removeTool(toolName);
-				} catch (err) {
-					rawError(`Failed to re-block "${toolName}": ${err}`);
-				}
-			}
-		}
+		// Re-block after the operation completes
+		blockedSet = new Set(blockedTools);
+		applyBlock(pi);
+		allowOnceFlag = false;
 	}
+}
+
+/**
+ * Signal that a single allow-once operation has completed.
+ * Called by index.ts after the tool_result event to re-block tools.
+ */
+export function consumeAllowOnce(
+	pi: ExtensionAPI,
+	blockedTools: string[],
+): boolean {
+	if (!allowOnceFlag) return false;
+	blockedSet = new Set(blockedTools);
+	applyBlock(pi);
+	allowOnceFlag = false;
+	return true;
+}
+
+/**
+ * Check whether a single-shot allow-once is active.
+ */
+export function isAllowOnceActive(): boolean {
+	return allowOnceFlag;
 }
 
 /**
  * Check whether a given tool is currently blocked.
  */
 export function isBlocked(toolName: string): boolean {
-	return removedTools.has(toolName);
+	return blockedSet.has(toolName);
 }
 
 /**
  * Get the list of currently blocked tool names.
  */
 export function getBlockedTools(): string[] {
-	return Array.from(removedTools.keys());
+	return [...blockedSet];
 }
 
 /**
  * Clear all blocked tool state (useful for testing / full reset).
  */
 export function reset(): void {
-	removedTools.clear();
+	blockedSet.clear();
+	allowOnceFlag = false;
+}
+
+// ---------------------------------------------------------------------------
+// Internals
+// ---------------------------------------------------------------------------
+
+function applyBlock(pi: ExtensionAPI): void {
+	const all = pi.getAllTools().map((t) => t.name);
+	const active = all.filter((name) => !blockedSet.has(name));
+
+	// Always keep "subagent" — the bridge to the reader
+	if (!active.includes("subagent")) {
+		active.push("subagent");
+	}
+
+	pi.setActiveTools(active);
 }

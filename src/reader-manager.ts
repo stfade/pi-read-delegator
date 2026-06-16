@@ -11,7 +11,6 @@ import * as path from "path";
 import * as os from "os";
 import { exec } from "child_process";
 import type { ReadDelegatorConfig } from "./config";
-import type { ExtensionAgent } from "./tool-blocker";
 import { rawLog, rawWarn, rawError } from "./ui";
 
 // ---------------------------------------------------------------------------
