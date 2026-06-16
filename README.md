@@ -88,7 +88,7 @@ Record results below.
 ## Installation
 
 ```bash
-pi install @stfade/pi-read-delegator
+pi install npm:@stfade/pi-read-delegator
 ```
 
 On first session start, the extension:
